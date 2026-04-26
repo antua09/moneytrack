@@ -1,7 +1,7 @@
 import { useState, useEffect } from "react";
 
 // Uses frankfurter.app — free, no API key needed
-const API = "https://api.frankfurter.app/latest?from=USD&to=MXN";
+const API = "https://open.er-api.com/v6/latest/USD";
 
 export function useExchangeRate() {
   const [rate, setRate]       = useState(null);
@@ -16,7 +16,7 @@ export function useExchangeRate() {
       const res = await fetch(API);
       if (!res.ok) throw new Error("Network error");
       const data = await res.json();
-      const r = data.rates?.MXN;
+      const r = data.rates?.MXN;  // open.er-api format
       if (r) {
         setRate(r);
         setLastFetch(new Date());
