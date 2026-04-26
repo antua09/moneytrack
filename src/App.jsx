@@ -4,6 +4,10 @@ import { collection, doc, setDoc, getDoc, deleteDoc, onSnapshot, query, orderBy 
 import { auth, db } from "./firebase";
 import { PieChart, Pie, Cell, BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, LineChart, Line } from "recharts";
 import { t, LANGS, TR } from "./i18n";
+import CSVImporter from "./CSVImporter";
+import GoalsPanel from "./GoalsPanel";
+import RecurringPanel from "./RecurringPanel";
+import { useExchangeRate, ExchangeWidget } from "./ExchangeRate";
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 const CATEGORIES = [
@@ -489,6 +493,12 @@ export default function App() {
   const [showProfile,setShowProfile]   = useState(false);
   const [showCardMgr,setShowCardMgr]   = useState(false);
   const [showSettings,setShowSettings] = useState(false);
+  const [showImporter,setShowImporter]   = useState(false);
+  const [showGoals,setShowGoals]         = useState(false);
+  const [showRecurring,setShowRecurring] = useState(false);
+  const [showExchange,setShowExchange]   = useState(false);
+  const [goals,setGoals]                 = useState([]);
+  const [recurring,setRecurring]         = useState([]);
   const [saving,setSaving]             = useState(false);
   const unsubRefs                      = useRef([]);
 
@@ -511,11 +521,24 @@ export default function App() {
     const u3=onSnapshot(query(collection(db,`users/${uid}/cards`),orderBy("createdAt","asc")),s=>setCards(s.docs.map(d=>({id:d.id,...d.data()}))));
     const u4=onSnapshot(query(collection(db,`users/${uid}/settings`)),s=>{ const d=s.docs.find(d=>d.id==="budget"); const b=d?.data()?.weekBudget||0; setWeekBudget(b); setBudgetInput(b?String(b):""); });
     const u5=onSnapshot(doc(db,`users/${uid}/profile/main`),s=>{ if(s.exists()){const p=s.data(); setProfile(p); if(p.lang) setLangRaw(p.lang); } });
-    unsubRefs.current=[u1,u2,u3,u4,u5];
-    return ()=>{ u1();u2();u3();u4();u5(); };
+    const u6=onSnapshot(query(collection(db,`users/${uid}/goals`),orderBy('createdAt','asc')),s=>setGoals(s.docs.map(d=>({id:d.id,...d.data()}))));
+    const u7=onSnapshot(query(collection(db,`users/${uid}/recurring`),orderBy('createdAt','asc')),s=>setRecurring(s.docs.map(d=>({id:d.id,...d.data()}))));
+    unsubRefs.current=[u1,u2,u3,u4,u5,u6,u7];
+    return ()=>{ u1();u2();u3();u4();u5();u6();u7(); };
   },[user]);
 
   useEffect(()=>lsSet("mt_theme",isDark),[isDark]);
+  // Process recurring on load
+  useEffect(()=>{ if(user&&recurring.length>0) processRecurring(); },[recurring,user]);
+  // Budget notification check
+  useEffect(()=>{
+    if(!weekBudget||!totalMXN) return;
+    const pct=(totalMXN/weekBudget)*100;
+    const key=`mt_notif_${new Date().toISOString().slice(0,7)}`;
+    const sent=localStorage.getItem(key)||"0";
+    if(pct>=100&&sent!=="100"){ sendBudgetNotif(pct); localStorage.setItem(key,"100"); }
+    else if(pct>=80&&sent!=="80"&&sent!=="100"){ sendBudgetNotif(pct); localStorage.setItem(key,"80"); }
+  },[totalMXN,weekBudget]);
   useEffect(()=>{ if(!incomeMode&&(view==="incomes"||view==="addIncome")) setView("dashboard"); },[incomeMode]);
 
   const uid=user?.uid;
@@ -527,6 +550,42 @@ export default function App() {
   const addCard=async(card)=>setDoc(doc(db,`users/${uid}/cards/${card.id}`),{...card,createdAt:new Date().toISOString()});
   const deleteCard=async(id)=>{ await deleteDoc(doc(db,`users/${uid}/cards/${id}`)); if(form.cardId===id)setForm(f=>({...f,cardId:cards.find(c=>c.id!==id)?.id||null})); };
   const handleLogout=()=>signOut(auth);
+  const handleCSVImport=async(rows)=>{ for(const row of rows){ const id=Date.now().toString()+Math.random().toString(36).slice(2); if(row.type==="income"){ await setDoc(doc(db,`users/${uid}/incomes/${id}`),{amount:row.amount,category:row.category||"sueldo",currency:"MXN",note:row.desc||"",date:row.date,createdAt:new Date().toISOString()}); } else { await setDoc(doc(db,`users/${uid}/expenses/${id}`),{amount:row.amount,category:row.category||"otros",method:"efectivo",currency:"MXN",cardId:null,note:row.desc||"",date:row.date,createdAt:new Date().toISOString()}); } } };
+  // ── Goals ──────────────────────────────────────────────────────────────────
+  const addGoal        = async(g)   => { const id=Date.now().toString(); await setDoc(doc(db,`users/${uid}/goals/${id}`),{...g,id,saved:0}); };
+  const deleteGoal     = async(id)  => deleteDoc(doc(db,`users/${uid}/goals/${id}`));
+  const addContrib     = async(id,amt) => { const g=goals.find(x=>x.id===id); if(!g)return; await setDoc(doc(db,`users/${uid}/goals/${id}`),{...g,saved:(g.saved||0)+amt},{merge:true}); };
+  // ── Recurring ───────────────────────────────────────────────────────────────
+  const addRecurring    = async(r)  => { const id=Date.now().toString(); await setDoc(doc(db,`users/${uid}/recurring/${id}`),{...r,id}); };
+  const deleteRecurring = async(id) => deleteDoc(doc(db,`users/${uid}/recurring/${id}`));
+  const toggleRecurring = async(id,active) => { const r=recurring.find(x=>x.id===id); if(!r)return; await setDoc(doc(db,`users/${uid}/recurring/${id}`),{...r,active},{merge:true}); };
+  // ── Notifications ───────────────────────────────────────────────────────────
+  const requestNotifPermission = async() => {
+    if(!("Notification" in window)) return false;
+    if(Notification.permission==="granted") return true;
+    const perm = await Notification.requestPermission();
+    return perm==="granted";
+  };
+  const sendBudgetNotif = (pct) => {
+    if(!("Notification" in window)||Notification.permission!=="granted") return;
+    if(pct>=100) new Notification("MoneyTrack 🚨",{body:"¡Presupuesto agotado! Has superado tu límite semanal.",icon:"/icon-192.png"});
+    else if(pct>=80) new Notification("MoneyTrack ⚠️",{body:`Llevas el ${pct.toFixed(0)}% de tu presupuesto semanal gastado.`,icon:"/icon-192.png"});
+  };
+  // ── Auto-generate recurring expenses ────────────────────────────────────────
+  const processRecurring = async() => {
+    const today = new Date().toISOString().slice(0,10);
+    for(const r of recurring){
+      if(!r.active || !r.nextDate || r.nextDate > today) continue;
+      const id = Date.now().toString()+Math.random().toString(36).slice(2);
+      await setDoc(doc(db,`users/${uid}/expenses/${id}`),{amount:r.amount,category:r.category,method:"efectivo",currency:"MXN",cardId:null,note:r.name+" (recurrente)",date:r.nextDate,createdAt:new Date().toISOString()});
+      // Advance nextDate
+      const d = new Date(r.nextDate+"T12:00:00");
+      if(r.frequency==="weekly")   d.setDate(d.getDate()+7);
+      else if(r.frequency==="biweekly") d.setDate(d.getDate()+14);
+      else d.setMonth(d.getMonth()+1);
+      await setDoc(doc(db,`users/${uid}/recurring/${r.id}`),{...r,nextDate:d.toISOString().slice(0,10)},{merge:true});
+    }
+  };
   const saveProfile=async(data)=>{ await setDoc(doc(db,`users/${uid}/profile/main`),{...profile,...data,lang},{ merge:true }); };
 
   // Derived
@@ -546,12 +605,14 @@ export default function App() {
     return {chartWeeks:weeks.slice(-5).map((w,i)=>({label:i===4?(lang==="zh"?"本周":lang==="en"?"Now":"Esta"):`S-${4-i}`,total:w.total,isCurrent:w.isCurrent})),avgWeek:wwd.length>0?wwd.reduce((s,w)=>s+w.total,0)/wwd.length:0,bestWeek:wwd.length>0?wwd.reduce((a,b)=>a.total<b.total?a:b):null,monthTotal,avgDay:now.getDate()>0?monthTotal/now.getDate():0};
   })();
 
+  const totalHistInc=incomes.filter(i=>i.currency!=="USD").reduce((s,i)=>s+i.amount,0);
+  const totalHistExp=expenses.filter(e=>e.currency!=="USD").reduce((s,e)=>s+e.amount,0);
   const cat=(id)=>CATEGORIES.find(c=>c.id===id)||CATEGORIES[6];
   const icat=(id)=>INCOME_CATEGORIES.find(c=>c.id===id)||INCOME_CATEGORIES[5];
   const card=(id)=>cards.find(c=>c.id===id)||null;
   const tooltipStyle={background:T.surface,border:`1px solid ${T.border}`,borderRadius:8,fontSize:fs(11,sc),color:T.text};
 
-  const navTabs=[["dashboard","📊",t("week",lang)],["analysis","📈",t("analysis",lang)],...(incomeMode?[["incomes","💰",t("incomes",lang)]]:[]),["add","➕",t("add",lang)],["history","📋",t("history",lang)]];
+  const navTabs=[["dashboard","📊",t("week",lang)],["analysis","📈",t("analysis",lang)],...(incomeMode?[["incomes","💰",t("incomes",lang)]]:[]),["add","➕",t("add",lang)],["history","📋",t("history",lang)],["extras","✨","Extras"]];
 
   if(user===undefined) return (<div style={{background:DARK.bg,minHeight:"100vh",display:"flex",alignItems:"center",justifyContent:"center",flexDirection:"column",gap:16}}><div style={{fontSize:24,fontWeight:900,color:"#f1f5f9",letterSpacing:-1}}>MoneyTrack</div><div style={{color:"#475569",fontSize:14}}>{t("loading",lang)}</div></div>);
   if(!user) return <AuthScreen T={T} isDark={isDark} toggleTheme={toggleTheme} sc={sc} lang={lang} setLang={setLang}/>;
@@ -559,6 +620,9 @@ export default function App() {
   return (
     <div style={{fontFamily:"'DM Sans','Segoe UI',sans-serif",background:T.bg,minHeight:"100vh",color:T.text,maxWidth:480,margin:"0 auto",paddingBottom:90,transition:"background 0.3s",fontSize:fs(14,sc)}}>
       {showCardMgr&&<CardManager cards={cards} onAdd={addCard} onDelete={deleteCard} onClose={()=>setShowCardMgr(false)} T={T} sc={sc} lang={lang}/>}
+      {showImporter&&<CSVImporter onImport={handleCSVImport} onClose={()=>setShowImporter(false)} T={T} sc={sc} lang={lang}/>}
+      {showGoals&&<GoalsPanel goals={goals} onAdd={addGoal} onDelete={deleteGoal} onAddContribution={addContrib} balance={totalHistInc-totalHistExp} T={T} sc={sc} lang={lang} onClose={()=>setShowGoals(false)}/>}
+      {showRecurring&&<RecurringPanel recurring={recurring} onAdd={addRecurring} onDelete={deleteRecurring} onToggle={toggleRecurring} T={T} sc={sc} lang={lang} onClose={()=>setShowRecurring(false)}/>}
       {showSettings&&<SettingsPanel isDark={isDark} toggleTheme={toggleTheme} fontScale={fontScale} setFontScale={setFontScale} incomeMode={incomeMode} setIncomeMode={setIncomeMode} lang={lang} setLang={setLang} T={T} sc={sc} onClose={()=>setShowSettings(false)}/>}
       {showProfile&&<ProfilePanel user={user} profile={profile} onSaveProfile={saveProfile} onLogout={handleLogout} onOpenCards={()=>setShowCardMgr(true)} cards={cards} T={T} sc={sc} lang={lang} onClose={()=>setShowProfile(false)}/>}
 
@@ -719,6 +783,7 @@ export default function App() {
           <div>
             <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:14}}>
               <div style={{fontSize:fs(15,sc),fontWeight:800,color:T.text}}>{t("historyTitle",lang)}</div>
+              <button onClick={()=>setShowImporter(true)} style={{background:"#2563eb",border:"none",color:"#fff",borderRadius:8,padding:"6px 12px",fontSize:fs(11,sc),fontWeight:700,cursor:"pointer"}}>📂 Importar CSV</button>
               <div style={{fontSize:fs(12,sc),color:T.textMute}}>{filtered.length} {t("expenses",lang)}</div>
             </div>
             {filtered.length===0?(<div style={{textAlign:"center",padding:"50px 0",color:T.textMute}}><div style={{fontSize:40}}>📭</div><div style={{marginTop:12,fontSize:fs(14,sc)}}>{t("noExpWeek",lang)}</div></div>):(
@@ -749,6 +814,51 @@ export default function App() {
           </div>
         )}
       </div>
+
+      
+        {/* ── EXTRAS ── */}
+        {view==="extras"&&(
+          <div>
+            <div style={{fontSize:fs(15,sc),fontWeight:800,color:T.text,marginBottom:18}}>✨ Extras</div>
+
+            {/* Notification request */}
+            {"Notification" in window && Notification.permission!=="granted" && (
+              <div style={{background:"#1d4ed822",border:"1px solid #2563eb44",borderRadius:14,padding:"14px 16px",marginBottom:16,display:"flex",gap:12,alignItems:"center"}}>
+                <span style={{fontSize:24,flexShrink:0}}>🔔</span>
+                <div style={{flex:1}}>
+                  <div style={{fontSize:fs(13,sc),fontWeight:700,color:T.text}}>Activar notificaciones</div>
+                  <div style={{fontSize:fs(11,sc),color:T.textMute,marginTop:2}}>Te avisaremos cuando llegues al 80% y 100% de tu presupuesto</div>
+                </div>
+                <button onClick={requestNotifPermission} style={{background:"#2563eb",border:"none",color:"#fff",borderRadius:9,padding:"8px 14px",fontSize:fs(12,sc),fontWeight:700,cursor:"pointer",whiteSpace:"nowrap"}}>Activar</button>
+              </div>
+            )}
+            {"Notification" in window && Notification.permission==="granted" && (
+              <div style={{background:"#0d2b1a",border:"1px solid #22c55e33",borderRadius:14,padding:"12px 16px",marginBottom:16,display:"flex",gap:10,alignItems:"center"}}>
+                <span style={{fontSize:20}}>✅</span>
+                <div style={{fontSize:fs(12,sc),color:"#22c55e",fontWeight:600}}>Notificaciones de presupuesto activadas</div>
+              </div>
+            )}
+
+            {/* Quick access cards */}
+            {[
+              {icon:"🎯",label:"Metas de Ahorro",desc:`${goals.length} metas · Balance ${fmtMXN(totalHistInc-totalHistExp)}`,color:"#2563eb",action:()=>setShowGoals(true)},
+              {icon:"🔁",label:"Gastos Recurrentes",desc:`${recurring.filter(r=>r.active).length} activos · ~${fmtMXN(recurring.filter(r=>r.active).reduce((s,r)=>s+(r.frequency==="weekly"?r.amount*4:r.frequency==="biweekly"?r.amount*2:r.amount),0))}/mes`,color:"#7c3aed",action:()=>setShowRecurring(true)},
+              {icon:"📂",label:"Importar CSV",desc:"Importa movimientos de tu banco",color:"#059669",action:()=>setShowImporter(true)},
+            ].map(card=>(
+              <button key={card.label} onClick={card.action} style={{width:"100%",display:"flex",alignItems:"center",gap:14,background:T.surface,border:`1px solid ${T.border}`,borderRadius:14,padding:"16px",marginBottom:12,cursor:"pointer",textAlign:"left"}}>
+                <div style={{width:46,height:46,borderRadius:13,background:`${card.color}20`,display:"flex",alignItems:"center",justifyContent:"center",fontSize:24,flexShrink:0}}>{card.icon}</div>
+                <div style={{flex:1}}>
+                  <div style={{fontSize:fs(14,sc),fontWeight:700,color:T.text}}>{card.label}</div>
+                  <div style={{fontSize:fs(11,sc),color:T.textMute,marginTop:3}}>{card.desc}</div>
+                </div>
+                <div style={{fontSize:18,color:T.textMute}}>›</div>
+              </button>
+            ))}
+
+            {/* Exchange rate widget */}
+            <ExchangeWidget T={T} sc={sc} lang={lang}/>
+          </div>
+        )}
 
       {view!=="add"&&view!=="addIncome"&&(<button onClick={()=>setView("add")} style={{position:"fixed",bottom:22,right:22,width:52,height:52,borderRadius:"50%",background:"linear-gradient(135deg,#2563eb,#1d4ed8)",border:"none",color:"#fff",fontSize:26,cursor:"pointer",boxShadow:"0 4px 22px #2563eb55",display:"flex",alignItems:"center",justifyContent:"center"}}>+</button>)}
     </div>
